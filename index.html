@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kick Multi-Pane Sender</title>
+<style>
+  :root { --bg:#0e0e10; --panel:#18181b; --line:#2a2a2e; --text:#efeff1; --mute:#9a9aa3; --green:#53fc18; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px system-ui,sans-serif; display:flex; flex-direction:column; height:100vh; }
+  header, footer { padding:10px 14px; background:var(--panel); display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  header { border-bottom:1px solid var(--line); } footer { border-top:1px solid var(--line); }
+  input, textarea { background:#0e0e10; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:8px 10px; font:inherit; }
+  button { background:var(--green); color:#000; border:0; border-radius:6px; padding:8px 14px; font-weight:700; cursor:pointer; }
+  button.ghost { background:#2a2a2e; color:var(--text); }
+  #token { width:240px; } #channel { width:280px; } #count { width:64px; } #delay { width:84px; }
+  #grid { flex:1; display:grid; gap:6px; padding:6px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); grid-auto-rows:minmax(240px,1fr); overflow:auto; }
+  .cell { background:var(--panel); border:1px solid var(--line); border-radius:8px; display:flex; flex-direction:column; overflow:hidden; }
+  .cell h4 { margin:0; padding:6px 10px; font-size:12px; display:flex; justify-content:space-between; border-bottom:1px solid var(--line); }
+  .cell iframe { flex:1; border:0; width:100%; }
+  .ok { color:var(--green); } .err { color:#ff6b6b; } .wait { color:var(--mute); }
+  #msg { flex:1; min-width:200px; resize:none; height:42px; }
+  label { color:var(--mute); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <input id="token" type="password" placeholder="Kick API access token (chat:write)">
+  <input id="channel" placeholder="Channel link, e.g. https://kick.com/name">
+  <label>Panes <input id="count" type="number" min="1" max="8" value="5"></label>
+  <label>Delay (ms) <input id="delay" type="number" min="300" step="100" value="1000"></label>
+  <button id="load">Load</button>
+  <button class="ghost" id="help">Help</button>
+</header>
+
+<div id="grid"></div>
+
+<footer>
+  <textarea id="msg" maxlength="500" placeholder="Type once → sent once per pane (Enter to send)"></textarea>
+  <button id="send">Send to all panes</button>
+</footer>
+
+<script>
+const API = "https://api.kick.com/public/v1";
+const $ = id => document.getElementById(id);
+let broadcasterId = null, slug = "", panes = 0;
+
+try {
+  $("token").value = localStorage.getItem("kmc_token") || "";
+  $("channel").value = localStorage.getItem("kmc_channel") || "";
+} catch(e){}
+
+const hdr = () => ({ "Authorization": "Bearer " + $("token").value.trim(), "Content-Type": "application/json" });
+const setStatus = (i, t, c) => { const el = $("st-" + i); if (el) { el.textContent = t; el.className = c; } };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+$("help").onclick = () => alert(
+`Kick's chat iframes are cross-origin, so this page can't type into them. The panes are for viewing; messages are sent through Kick's official API with your own token (scope: chat:write).
+
+Notes:
+- Slow mode, duplicate-message filters and mod timeouts in the channel can block or punish repeated messages. Keep the delay reasonable.
+- If the browser blocks the API call (CORS), a small local proxy is needed.`);
+
+function parseChannel(v) {
+  v = v.trim();
+  v = v.replace(/^https?:\/\//i, "").replace(/^(www\.)?kick\.com\//i, "");
+  v = v.replace(/^popout\//i, "");
+  return v.split(/[\/?#]/)[0].toLowerCase();
+}
+
+$("load").onclick = async () => {
+  slug = parseChannel($("channel").value);
+  panes = Math.min(8, Math.max(1, parseInt($("count").value) || 1));
+  try { localStorage.setItem("kmc_token", $("token").value); localStorage.setItem("kmc_channel", slug); } catch(e){}
+  if (!slug) return;
+  $("grid").innerHTML = "";
+  for (let i = 1; i <= panes; i++) {
+    const c = document.createElement("div");
+    c.className = "cell";
+    c.innerHTML = `<h4><span>Chat ${i} · ${slug}</span><span class="wait" id="st-${i}">loading…</span></h4>
+      <iframe src="https://kick.com/popout/${encodeURIComponent(slug)}/chat"></iframe>`;
+    $("grid").appendChild(c);
+  }
+  try {
+    const r = await fetch(`${API}/channels?slug=${encodeURIComponent(slug)}`, { headers: hdr() });
+    const j = await r.json();
+    broadcasterId = j.data && j.data[0] && j.data[0].broadcaster_user_id;
+    if (!broadcasterId) throw new Error("not found");
+    for (let i = 1; i <= panes; i++) setStatus(i, "ready", "ok");
+  } catch (e) {
+    broadcasterId = null;
+    for (let i = 1; i <= panes; i++) setStatus(i, "lookup failed", "err");
+  }
+};
+
+async function sendAll() {
+  const content = $("msg").value.trim();
+  if (!content || !broadcasterId) return;
+  const delay = Math.max(300, parseInt($("delay").value) || 1000);
+  $("msg").value = "";
+  for (let i = 1; i <= panes; i++) {
+    setStatus(i, "sending…", "wait");
+    try {
+      const r = await fetch(`${API}/chat`, {
+        method: "POST", headers: hdr(),
+        body: JSON.stringify({ broadcaster_user_id: broadcasterId, content, type: "user" })
+      });
+      if (!r.ok) throw new Error(r.status);
+      setStatus(i, "sent ✓", "ok");
+    } catch (e) { setStatus(i, "failed (" + e.message + ")", "err"); }
+    if (i < panes) await sleep(delay);
+  }
+}
+$("send").onclick = sendAll;
+$("msg").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAll(); } });
+</script>
+</body>
+</html>
